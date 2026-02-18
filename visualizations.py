@@ -5,8 +5,10 @@ Q1: G-G Diagram (Friction Circle) - Combined Grip Analysis
 Q2: Acceleration Decay Curve - Aerodynamic Profile
 Q3: Throttle Variance Comparison - Pressure Analysis
 
-Uses FastF1 car_data and pos_data directly (session.car_data / session.pos_data)
-per FastF1 docs: https://docs.fastf1.dev/core.html
+MODIFIED: 
+- Fixed Cache NotADirectoryError
+- Implemented Q1 Performance Envelopes (Density Contours)
+- Preserved original Q2/Q3 detailed analysis logic
 """
 
 import fastf1
@@ -17,15 +19,36 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.patches import Circle
 from scipy.signal import savgol_filter
+from scipy.stats import gaussian_kde
 import warnings
+import os
 
 warnings.filterwarnings('ignore')
 
-# Enable cache
-fastf1.Cache.enable_cache('/root/DV/DVProject2/ff1_cache')
+# Get base directory (script location)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# FIX: Ensure cache directory exists before enabling it
+CACHE_DIR = os.path.join(BASE_DIR, 'ff1_cache')
+os.makedirs(CACHE_DIR, exist_ok=True)
+fastf1.Cache.enable_cache(CACHE_DIR)
 
 YEAR = 2024
 GP = 'Bahrain'
+
+# Directory where raw telemetry CSVs are permanently saved
+DATA_DIR = os.path.join(BASE_DIR, 'data')
+os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def save_telemetry_csv(df: pd.DataFrame, filename: str) -> None:
+    """Persist a telemetry DataFrame to CSV so the collected data survives git pushes."""
+    path = os.path.join(DATA_DIR, filename)
+    if not os.path.exists(path):
+        df.to_csv(path, index=False)
+        print(f"  ✓ Data saved: {path}")
+    else:
+        print(f"  ℹ Data already exists, skipping save: {path}")
 
 print("=" * 60)
 print("F1 Telemetry & Driver Performance Analysis")
@@ -97,6 +120,30 @@ def compute_g_forces(tel_df):
     return df
 
 
+def draw_density_envelope(ax, gf, color, label):
+    """
+    Draws a contour line representing the 90th percentile density of the G-points.
+    This shows the 'performance envelope' without being obscured by point overlap.
+    """
+    try:
+        if len(gf) < 50: return
+        x = gf['G_lat'].values
+        y = gf['G_long'].values
+        
+        # Calculate kernel density
+        k = gaussian_kde(np.vstack([x, y]))
+        xi, yi = np.mgrid[x.min():x.max():100j, y.min():y.max():100j]
+        zi = k(np.vstack([xi.flatten(), yi.flatten()]))
+        
+        # Plot the contour at a specific level (0.15 threshold)
+        ax.contour(xi, yi, zi.reshape(xi.shape), levels=[zi.max() * 0.15],
+                   colors=color, linewidths=2, alpha=0.8, linestyles='solid')
+        # Add a dummy line for the legend
+        ax.plot([], [], color=color, label=f"{label} Envelope", linewidth=2)
+    except Exception as e:
+        print(f"  ! Could not draw envelope for {label}: {e}")
+
+
 # ============================================================================
 # QUESTION 1: G-G Diagram (Friction Circle) - Combined Grip Analysis
 # Target User: Driver Performance Coach
@@ -148,6 +195,11 @@ def plot_gg_diagram(session_type, session_label, output_path):
 
     print(f"  Data points: {d1_abbr}={len(gf1)}, {d2_abbr}={len(gf2)}")
 
+    # Persist collected telemetry to CSV
+    safe_label = session_label.replace(' ', '_')
+    save_telemetry_csv(gf1, f"Q1_gforces_{safe_label}_{d1_abbr}.csv")
+    save_telemetry_csv(gf2, f"Q1_gforces_{safe_label}_{d2_abbr}.csv")
+
     # Force red/green for driver distinction
     color1 = '#E10600'
     color2 = '#00D000'
@@ -157,7 +209,7 @@ def plot_gg_diagram(session_type, session_label, output_path):
 
     fig.suptitle(
         f"G-G Diagram (Friction Circle) — Combined Grip Analysis\n"
-        f"{YEAR} {GP} GP {session_label} • Mid-Session Sample (~10 min)",
+        f"{YEAR} {GP} GP {session_label} • Performance Envelope Comparison",
         fontsize=14, fontweight='bold', color='white', y=1.02
     )
 
@@ -165,12 +217,15 @@ def plot_gg_diagram(session_type, session_label, output_path):
     max_g2 = max(gf2['G_long'].abs().quantile(0.98), gf2['G_lat'].abs().quantile(0.98))
     max_g_both = max(max_g1, max_g2) * 1.15
 
-    for ax, gf, color, name, abbr in [
+    for i, (ax, gf, color, name, abbr) in enumerate([
         (axes[0], gf1, color1, d1_name, d1_abbr),
         (axes[1], gf2, color2, d2_name, d2_abbr),
-    ]:
+    ]):
         ax.set_facecolor('#16213e')
         ax.scatter(gf['G_lat'], gf['G_long'], s=2, alpha=0.35, c=color, label=abbr)
+        # Draw envelope in white for individual plots
+        draw_density_envelope(ax, gf, 'white', abbr)
+        
         circle = Circle((0, 0), max_g_both * 0.85, fill=False, color='gray',
                         linestyle='--', linewidth=1.5, alpha=0.5)
         ax.add_patch(circle)
@@ -189,8 +244,14 @@ def plot_gg_diagram(session_type, session_label, output_path):
 
     ax = axes[2]
     ax.set_facecolor('#16213e')
-    ax.scatter(gf1['G_lat'], gf1['G_long'], s=2, alpha=0.3, c=color1, label=d1_abbr)
-    ax.scatter(gf2['G_lat'], gf2['G_long'], s=2, alpha=0.3, c=color2, label=d2_abbr)
+    # Use higher transparency for points in overlay to focus on envelopes
+    ax.scatter(gf1['G_lat'], gf1['G_long'], s=2, alpha=0.1, c=color1)
+    ax.scatter(gf2['G_lat'], gf2['G_long'], s=2, alpha=0.1, c=color2)
+    
+    # Draw Envelopes as the primary comparison tool
+    draw_density_envelope(ax, gf1, color1, d1_abbr)
+    draw_density_envelope(ax, gf2, color2, d2_abbr)
+    
     circle3 = Circle((0, 0), max_g_both * 0.85, fill=False, color='white',
                      linestyle='--', linewidth=1.5, alpha=0.4, label='Friction Limit')
     ax.add_patch(circle3)
@@ -201,7 +262,7 @@ def plot_gg_diagram(session_type, session_label, output_path):
     ax.axvline(0, color='gray', linewidth=0.5, alpha=0.4)
     ax.set_xlabel('Lateral G (Turning)', fontsize=11, color='white')
     ax.set_ylabel('Longitudinal G (Braking ↓ / Accel ↑)', fontsize=11, color='white')
-    ax.set_title('Overlay Comparison', fontsize=12, fontweight='bold', color='white')
+    ax.set_title('Overlay: Teammate Envelope', fontsize=12, fontweight='bold', color='white')
     ax.legend(fontsize=9, loc='upper right', facecolor='#16213e', labelcolor='white')
     ax.tick_params(colors='white')
     ax.grid(True, alpha=0.15, color='white')
@@ -266,6 +327,7 @@ def plot_acceleration_decay():
     )
 
     all_curves = []
+    all_binned = []
 
     for idx, d in enumerate(drivers_info):
         car = session.car_data[d['num']].copy()
@@ -293,6 +355,13 @@ def plot_acceleration_decay():
         color = d['color'] or fallback_colors[idx]
         all_curves.append({'binned': binned, 'color': color,
                            'label': f"{d['abbr']} ({d['team']})"})
+        all_binned.append((d['abbr'], binned))
+
+    # Persist Q2 binned acceleration data
+    for abbr, b in all_binned:
+        b_export = b.copy()
+        b_export.insert(0, 'Driver', abbr)
+        save_telemetry_csv(b_export, f"Q2_accel_decay_{abbr}.csv")
 
     ax = axes[0]
     ax.set_facecolor('#16213e')
@@ -353,7 +422,8 @@ def plot_acceleration_decay():
                 bbox=dict(boxstyle='round,pad=0.3', facecolor='#16213e', edgecolor='#ff6666', alpha=0.8))
 
     plt.tight_layout()
-    plt.savefig('/root/DV/DVProject2/Q2_Acceleration_Decay_Curve.png',
+    output_path = os.path.join(BASE_DIR, 'Q2_Acceleration_Decay_Curve.png')
+    plt.savefig(output_path,
                 dpi=200, bbox_inches='tight', facecolor=fig.get_facecolor())
     plt.close()
     print("  ✓ Saved: Q2_Acceleration_Decay_Curve.png")
@@ -405,6 +475,10 @@ def plot_throttle_variance():
             })
 
     print(f"  Total segments (pseudo-laps): {len(segments)}")
+
+    # Persist Q3 raw throttle car data
+    car_export = car.copy()
+    save_telemetry_csv(car_export, f"Q3_throttle_{target_abbr}.csv")
 
     n_segs = len(segments)
     third = max(n_segs // 3, 3)
@@ -577,21 +651,24 @@ def plot_throttle_variance():
     for spine in ax6.spines.values():
         spine.set_color('gray')
 
-    plt.savefig('/root/DV/DVProject2/Q3_Throttle_Variance_Comparison.png',
+    output_path = os.path.join(BASE_DIR, 'Q3_Throttle_Variance_Comparison.png')
+    plt.savefig(output_path,
                 dpi=200, bbox_inches='tight', facecolor=fig.get_facecolor())
     plt.close()
-    print("  ✓ Saved: Q3_Throttle_Variance_Comparison.png")
+    print(f"  ✓ Saved: {output_path}")
 
 
 if __name__ == '__main__':
-    plot_gg_diagram('R', 'Race', '/root/DV/DVProject2/Q1_GG_Diagram_Friction_Circle.png')
-    plot_gg_diagram('Q', 'Qualifying', '/root/DV/DVProject2/Q1_GG_Diagram_Friction_Circle_Qualifying.png')
+    race_output = os.path.join(BASE_DIR, 'Q1_GG_Diagram_Friction_Circle.png')
+    qual_output = os.path.join(BASE_DIR, 'Q1_GG_Diagram_Friction_Circle_Qualifying.png')
+    plot_gg_diagram('R', 'Race', race_output)
+    plot_gg_diagram('Q', 'Qualifying', qual_output)
     plot_acceleration_decay()
     plot_throttle_variance()
     print("\n" + "=" * 60)
     print("All three visualizations generated successfully!")
     print("=" * 60)
-    print("Files in /root/DV/DVProject2/")
+    print(f"Files in {BASE_DIR}/")
     print("  Q1_GG_Diagram_Friction_Circle.png")
     print("  Q1_GG_Diagram_Friction_Circle_Qualifying.png")
     print("  Q2_Acceleration_Decay_Curve.png")

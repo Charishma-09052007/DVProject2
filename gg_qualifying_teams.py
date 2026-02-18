@@ -4,20 +4,45 @@ Creates 3 plots: Red Bull, Mercedes, McLaren
 
 Uses FastF1 car_data and pos_data directly per docs:
 https://docs.fastf1.dev/core.html
+
+MODIFIED: 
+- Fixed Cache NotADirectoryError
+- Implemented Performance Envelopes (Density Contours) for cleaner overlay.
 """
 
+import os
 import fastf1
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
 from scipy.signal import savgol_filter
+from scipy.stats import gaussian_kde
 import warnings
 
 warnings.filterwarnings('ignore')
 
-# Cache
-fastf1.Cache.enable_cache('/root/DV/DVProject2/ff1_cache')
+# Get base directory (script location)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# FIX: Create cache directory if it doesn't exist
+CACHE_DIR = os.path.join(BASE_DIR, 'ff1_cache')
+os.makedirs(CACHE_DIR, exist_ok=True)
+fastf1.Cache.enable_cache(CACHE_DIR)
+
+# Directory where raw telemetry CSVs are permanently saved
+DATA_DIR = os.path.join(BASE_DIR, 'data')
+os.makedirs(DATA_DIR, exist_ok=True)
+
+
+def save_telemetry_csv(df: pd.DataFrame, filename: str) -> None:
+    """Persist a telemetry DataFrame to CSV so the collected data survives git pushes."""
+    path = os.path.join(DATA_DIR, filename)
+    if not os.path.exists(path):
+        df.to_csv(path, index=False)
+        print(f"  ✓ Data saved: {path}")
+    else:
+        print(f"  ℹ Data already exists, skipping save: {path}")
 
 YEAR = 2024
 GP = 'Bahrain'
@@ -36,10 +61,15 @@ TEAM_COLORS = {
     'McLaren': ('#E10600', '#00D000'),
 }
 
+def get_output_path(team_key: str) -> str:
+    """Generate output path for a team's G-G diagram."""
+    filename = f'Q1_GG_Qualifying_{team_key.replace(" ", "")}.png'
+    return os.path.join(BASE_DIR, filename)
+
 OUTPUTS = {
-    'Red Bull': '/root/DV/DVProject2/Q1_GG_Qualifying_RedBull.png',
-    'Mercedes': '/root/DV/DVProject2/Q1_GG_Qualifying_Mercedes.png',
-    'McLaren': '/root/DV/DVProject2/Q1_GG_Qualifying_McLaren.png',
+    'Red Bull': get_output_path('Red Bull'),
+    'Mercedes': get_output_path('Mercedes'),
+    'McLaren': get_output_path('McLaren'),
 }
 
 
@@ -95,6 +125,21 @@ def mid_window(df):
     return df[mask]
 
 
+def draw_density_envelope(ax, gf, color, label):
+    """Draws a boundary line for the driver's performance envelope."""
+    try:
+        if len(gf) < 50: return
+        x, y = gf['G_lat'].values, gf['G_long'].values
+        k = gaussian_kde(np.vstack([x, y]))
+        xi, yi = np.mgrid[x.min():x.max():100j, y.min():y.max():100j]
+        zi = k(np.vstack([xi.flatten(), yi.flatten()]))
+        ax.contour(xi, yi, zi.reshape(xi.shape), levels=[zi.max() * 0.15],
+                   colors=color, linewidths=2, alpha=0.8)
+        ax.plot([], [], color=color, label=f"{label} Envelope", linewidth=2)
+    except:
+        pass
+
+
 def plot_team_gg(session, team_key, team_name):
     results = session.results
     team_results = results[results['TeamName'] == team_name]
@@ -120,14 +165,17 @@ def plot_team_gg(session, team_key, team_name):
     gf1 = compute_g_forces(tel1)
     gf2 = compute_g_forces(tel2)
 
+    save_telemetry_csv(gf1, f"Q1_gforces_Qualifying_{team_key.replace(' ', '_')}_{d1_abbr}.csv")
+    save_telemetry_csv(gf2, f"Q1_gforces_Qualifying_{team_key.replace(' ', '_')}_{d2_abbr}.csv")
+
     color1, color2 = TEAM_COLORS[team_key]
 
     fig, axes = plt.subplots(1, 3, figsize=(20, 7))
     fig.patch.set_facecolor('#1a1a2e')
 
     fig.suptitle(
-        f"G-G Diagram (Friction Circle) — Qualifying {YEAR} {GP}\n"
-        f"{team_key} • Mid-Session Sample (~10 min)",
+        f"G-G Diagram — Qualifying {YEAR} {GP}\n"
+        f"{team_key} • Performance Envelope Comparison",
         fontsize=14, fontweight='bold', color='white', y=1.02
     )
 
@@ -135,12 +183,14 @@ def plot_team_gg(session, team_key, team_name):
     max_g2 = max(gf2['G_long'].abs().quantile(0.98), gf2['G_lat'].abs().quantile(0.98))
     max_g_both = max(max_g1, max_g2) * 1.15
 
-    for ax, gf, color, name, abbr in [
+    for i, (ax, gf, color, name, abbr) in enumerate([
         (axes[0], gf1, color1, d1_name, d1_abbr),
         (axes[1], gf2, color2, d2_name, d2_abbr),
-    ]:
+    ]):
         ax.set_facecolor('#16213e')
-        ax.scatter(gf['G_lat'], gf['G_long'], s=2, alpha=0.35, c=color, label=abbr)
+        ax.scatter(gf['G_lat'], gf['G_long'], s=2, alpha=0.35, c=color)
+        draw_density_envelope(ax, gf, 'white', abbr)
+        
         circle = Circle((0, 0), max_g_both * 0.85, fill=False, color='gray',
                         linestyle='--', linewidth=1.5, alpha=0.5)
         ax.add_patch(circle)
@@ -149,8 +199,8 @@ def plot_team_gg(session, team_key, team_name):
         ax.set_aspect('equal')
         ax.axhline(0, color='gray', linewidth=0.5, alpha=0.4)
         ax.axvline(0, color='gray', linewidth=0.5, alpha=0.4)
-        ax.set_xlabel('Lateral G (Turning)', fontsize=11, color='white')
-        ax.set_ylabel('Longitudinal G (Braking ↓ / Accel ↑)', fontsize=11, color='white')
+        ax.set_xlabel('Lateral G', fontsize=11, color='white')
+        ax.set_ylabel('Longitudinal G', fontsize=11, color='white')
         ax.set_title(f'{name}', fontsize=12, fontweight='bold', color=color)
         ax.tick_params(colors='white')
         ax.grid(True, alpha=0.15, color='white')
@@ -159,8 +209,12 @@ def plot_team_gg(session, team_key, team_name):
 
     ax = axes[2]
     ax.set_facecolor('#16213e')
-    ax.scatter(gf1['G_lat'], gf1['G_long'], s=2, alpha=0.3, c=color1, label=d1_abbr)
-    ax.scatter(gf2['G_lat'], gf2['G_long'], s=2, alpha=0.3, c=color2, label=d2_abbr)
+    ax.scatter(gf1['G_lat'], gf1['G_long'], s=2, alpha=0.1, c=color1)
+    ax.scatter(gf2['G_lat'], gf2['G_long'], s=2, alpha=0.1, c=color2)
+    
+    draw_density_envelope(ax, gf1, color1, d1_abbr)
+    draw_density_envelope(ax, gf2, color2, d2_abbr)
+    
     circle3 = Circle((0, 0), max_g_both * 0.85, fill=False, color='white',
                      linestyle='--', linewidth=1.5, alpha=0.4, label='Friction Limit')
     ax.add_patch(circle3)
@@ -169,8 +223,8 @@ def plot_team_gg(session, team_key, team_name):
     ax.set_aspect('equal')
     ax.axhline(0, color='gray', linewidth=0.5, alpha=0.4)
     ax.axvline(0, color='gray', linewidth=0.5, alpha=0.4)
-    ax.set_xlabel('Lateral G (Turning)', fontsize=11, color='white')
-    ax.set_ylabel('Longitudinal G (Braking ↓ / Accel ↑)', fontsize=11, color='white')
+    ax.set_xlabel('Lateral G', fontsize=11, color='white')
+    ax.set_ylabel('Longitudinal G', fontsize=11, color='white')
     ax.set_title('Overlay Comparison', fontsize=12, fontweight='bold', color='white')
     ax.legend(fontsize=9, loc='upper right', facecolor='#16213e', labelcolor='white')
     ax.tick_params(colors='white')

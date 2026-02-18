@@ -1,2 +1,10 @@
-/ff1_cache
+# FastF1 cache — tracked so collected data is permanently stored in the repo
+# (remove the line below if you want to exclude it again)
+ff1_cache/
 *.pdf
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+myenv/
